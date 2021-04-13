@@ -9,8 +9,8 @@ use regex_syntax::is_word_byte;
 use regex_syntax::utf8::{Utf8Range, Utf8Sequence, Utf8Sequences};
 
 use crate::prog::{
-    EmptyLook, Inst, InstBytes, InstChar, InstEmptyLook, InstPtr, InstRanges,
-    InstSave, InstSplit, Program,
+    BytesInst, EmptyLook, InstBytes, InstChar, InstEmptyLook, InstPtr,
+    InstRanges, InstSave, InstSplit, InstTrait, Program, UnicodeInst,
 };
 
 use crate::Error;
@@ -29,9 +29,9 @@ struct Patch {
 // `Compiler` is only public via the `internal` module, so avoid deriving
 // `Debug`.
 #[allow(missing_debug_implementations)]
-pub struct Compiler {
-    insts: Vec<MaybeInst>,
-    compiled: Program,
+pub struct Compiler<I: InstTrait> {
+    insts: Vec<MaybeInst<I>>,
+    compiled: Program<I>,
     capture_name_idx: HashMap<String, usize>,
     num_exprs: usize,
     size_limit: usize,
@@ -41,7 +41,7 @@ pub struct Compiler {
     extra_inst_bytes: usize,
 }
 
-impl Compiler {
+impl<I: InstTrait> Compiler<I> {
     /// Create a new regular expression compiler.
     ///
     /// Various options can be set before calling `compile` on an expression.
@@ -64,22 +64,6 @@ impl Compiler {
     /// compilation will stop and return an error.
     pub fn size_limit(mut self, size_limit: usize) -> Self {
         self.size_limit = size_limit;
-        self
-    }
-
-    /// If bytes is true, then the program is compiled as a byte based
-    /// automaton, which incorporates UTF-8 decoding into the machine. If it's
-    /// false, then the automaton is Unicode scalar value based, e.g., an
-    /// engine utilizing such an automaton is responsible for UTF-8 decoding.
-    ///
-    /// The specific invariant is that when returning a byte based machine,
-    /// the neither the `Char` nor `Ranges` instructions are produced.
-    /// Conversely, when producing a Unicode scalar value machine, the `Bytes`
-    /// instruction is never produced.
-    ///
-    /// Note that `dfa(true)` implies `bytes(true)`.
-    pub fn bytes(mut self, yes: bool) -> Self {
-        self.compiled.is_bytes = yes;
         self
     }
 
@@ -110,13 +94,18 @@ impl Compiler {
         self.compiled.is_reverse = yes;
         self
     }
+}
 
+impl<I: InstTrait + From<(InstHole, usize)>> Compiler<I> {
     /// Compile a regular expression given its AST.
     ///
     /// The compiler is guaranteed to succeed unless the program exceeds the
     /// specified size limit. If the size limit is exceeded, then compilation
     /// stops and returns an error.
-    pub fn compile(mut self, exprs: &[Hir]) -> result::Result<Program, Error> {
+    pub fn compile(
+        mut self,
+        exprs: &[Hir],
+    ) -> result::Result<Program<I>, Error> {
         debug_assert!(!exprs.is_empty());
         self.num_exprs = exprs.len();
         if exprs.len() == 1 {
@@ -126,7 +115,7 @@ impl Compiler {
         }
     }
 
-    fn compile_one(mut self, expr: &Hir) -> result::Result<Program, Error> {
+    fn compile_one(mut self, expr: &Hir) -> result::Result<Program<I>, Error> {
         // If we're compiling a forward DFA and we aren't anchored, then
         // add a `.*?` before the first capture group.
         // Other matching engines handle this by baking the logic into the
@@ -147,14 +136,14 @@ impl Compiler {
         }
         self.fill_to_next(patch.hole);
         self.compiled.matches = vec![self.insts.len()];
-        self.push_compiled(Inst::Match(0));
+        self.push_compiled(I::new_match(0));
         self.compile_finish()
     }
 
     fn compile_many(
         mut self,
         exprs: &[Hir],
-    ) -> result::Result<Program, Error> {
+    ) -> result::Result<Program<I>, Error> {
         debug_assert!(exprs.len() > 1);
 
         self.compiled.is_anchored_start =
@@ -178,7 +167,7 @@ impl Compiler {
                 self.c_capture(0, expr)?.unwrap_or(self.next_inst());
             self.fill_to_next(hole);
             self.compiled.matches.push(self.insts.len());
-            self.push_compiled(Inst::Match(i));
+            self.push_compiled(I::new_match(i));
             prev_hole = self.fill_split(split, Some(entry), None);
         }
         let i = exprs.len() - 1;
@@ -187,11 +176,11 @@ impl Compiler {
         self.fill(prev_hole, entry);
         self.fill_to_next(hole);
         self.compiled.matches.push(self.insts.len());
-        self.push_compiled(Inst::Match(i));
+        self.push_compiled(I::new_match(i));
         self.compile_finish()
     }
 
-    fn compile_finish(mut self) -> result::Result<Program, Error> {
+    fn compile_finish(mut self) -> result::Result<Program<I>, Error> {
         self.compiled.insts =
             self.insts.into_iter().map(|inst| inst.unwrap()).collect();
         self.compiled.byte_classes = self.byte_classes.byte_classes();
@@ -489,9 +478,9 @@ impl Compiler {
         Ok(Some(Patch { hole: hole, entry: self.insts.len() - 1 }))
     }
 
-    fn c_concat<'a, I>(&mut self, exprs: I) -> ResultOrEmpty
+    fn c_concat<'a, E>(&mut self, exprs: E) -> ResultOrEmpty
     where
-        I: IntoIterator<Item = &'a Hir>,
+        E: IntoIterator<Item = &'a Hir>,
     {
         let mut exprs = exprs.into_iter();
         let Patch { mut hole, entry } = loop {
@@ -786,7 +775,7 @@ impl Compiler {
         }
     }
 
-    fn push_compiled(&mut self, inst: Inst) {
+    fn push_compiled(&mut self, inst: I) {
         self.insts.push(MaybeInst::Compiled(inst));
     }
 
@@ -810,8 +799,7 @@ impl Compiler {
     fn check_size(&self) -> result::Result<(), Error> {
         use std::mem::size_of;
 
-        let size =
-            self.extra_inst_bytes + (self.insts.len() * size_of::<Inst>());
+        let size = self.extra_inst_bytes + (self.insts.len() * size_of::<I>());
         if size > self.size_limit {
             Err(Error::CompiledTooBig(self.size_limit))
         } else {
@@ -839,29 +827,31 @@ impl Hole {
 }
 
 #[derive(Clone, Debug)]
-enum MaybeInst {
-    Compiled(Inst),
+enum MaybeInst<I> {
+    Compiled(I),
     Uncompiled(InstHole),
     Split,
     Split1(InstPtr),
     Split2(InstPtr),
 }
 
-impl MaybeInst {
+impl<I: InstTrait + From<(InstHole, usize)>> MaybeInst<I> {
     fn fill(&mut self, goto: InstPtr) {
         let maybeinst = match *self {
             MaybeInst::Split => MaybeInst::Split1(goto),
-            MaybeInst::Uncompiled(ref inst) => {
-                MaybeInst::Compiled(inst.fill(goto))
+            MaybeInst::Uncompiled(ref mut inst) => {
+                // Replace by dummy `InstHole`
+                let inst = std::mem::replace(inst, InstHole::Save { slot: 0 });
+                MaybeInst::Compiled((inst, goto).into())
             }
             MaybeInst::Split1(goto1) => {
-                MaybeInst::Compiled(Inst::Split(InstSplit {
+                MaybeInst::Compiled(I::new_split(InstSplit {
                     goto1: goto1,
                     goto2: goto,
                 }))
             }
             MaybeInst::Split2(goto2) => {
-                MaybeInst::Compiled(Inst::Split(InstSplit {
+                MaybeInst::Compiled(I::new_split(InstSplit {
                     goto1: goto,
                     goto2: goto2,
                 }))
@@ -878,7 +868,7 @@ impl MaybeInst {
     fn fill_split(&mut self, goto1: InstPtr, goto2: InstPtr) {
         let filled = match *self {
             MaybeInst::Split => {
-                Inst::Split(InstSplit { goto1: goto1, goto2: goto2 })
+                I::new_split(InstSplit { goto1: goto1, goto2: goto2 })
             }
             _ => unreachable!(
                 "must be called on Split instruction, \
@@ -913,7 +903,7 @@ impl MaybeInst {
         *self = MaybeInst::Split2(half_filled);
     }
 
-    fn unwrap(self) -> Inst {
+    fn unwrap(self) -> I {
         match self {
             MaybeInst::Compiled(inst) => inst,
             _ => unreachable!(
@@ -925,8 +915,10 @@ impl MaybeInst {
     }
 }
 
+// TODO: Specialize `compile` into `compile_bytes` and `compile_unicode`
+// to avoid making `InstHole` public?
 #[derive(Clone, Debug)]
-enum InstHole {
+pub enum InstHole {
     Save { slot: usize },
     EmptyLook { look: EmptyLook },
     Char { c: char },
@@ -934,33 +926,60 @@ enum InstHole {
     Bytes { start: u8, end: u8 },
 }
 
-impl InstHole {
-    fn fill(&self, goto: InstPtr) -> Inst {
-        match *self {
+impl From<(InstHole, InstPtr)> for UnicodeInst {
+    fn from(val: (InstHole, InstPtr)) -> UnicodeInst {
+        let (hole, goto) = val;
+        match hole {
             InstHole::Save { slot } => {
-                Inst::Save(InstSave { goto: goto, slot: slot })
+                UnicodeInst::Save(InstSave { goto: goto, slot: slot })
             }
             InstHole::EmptyLook { look } => {
-                Inst::EmptyLook(InstEmptyLook { goto: goto, look: look })
+                UnicodeInst::EmptyLook(InstEmptyLook {
+                    goto: goto,
+                    look: look,
+                })
             }
-            InstHole::Char { c } => Inst::Char(InstChar { goto: goto, c: c }),
-            InstHole::Ranges { ref ranges } => Inst::Ranges(InstRanges {
-                goto: goto,
-                ranges: ranges.clone().into_boxed_slice(),
-            }),
-            InstHole::Bytes { start, end } => {
-                Inst::Bytes(InstBytes { goto: goto, start: start, end: end })
+            InstHole::Char { c } => {
+                UnicodeInst::Char(InstChar { goto: goto, c: c })
             }
+            InstHole::Ranges { ref ranges } => {
+                UnicodeInst::Ranges(InstRanges {
+                    goto: goto,
+                    ranges: ranges.clone().into_boxed_slice(),
+                })
+            }
+            InstHole::Bytes { .. } => unreachable!(),
         }
     }
 }
 
-struct CompileClass<'a, 'b> {
-    c: &'a mut Compiler,
+impl From<(InstHole, InstPtr)> for BytesInst {
+    fn from(val: (InstHole, InstPtr)) -> BytesInst {
+        let (hole, goto) = val;
+        match hole {
+            InstHole::Save { slot } => {
+                BytesInst::Save(InstSave { goto: goto, slot: slot })
+            }
+            InstHole::EmptyLook { look } => {
+                BytesInst::EmptyLook(InstEmptyLook { goto: goto, look: look })
+            }
+            InstHole::Char { .. } => unreachable!(),
+            InstHole::Ranges { .. } => unreachable!(),
+            InstHole::Bytes { start, end } => BytesInst::Bytes(InstBytes {
+                goto: goto,
+                start: start,
+                end: end,
+            }),
+        }
+    }
+}
+
+struct CompileClass<'a, 'b, I: InstTrait> {
+    c: &'a mut Compiler<I>,
     ranges: &'b [hir::ClassUnicodeRange],
 }
 
-impl<'a, 'b> CompileClass<'a, 'b> {
+impl<'a, 'b, I: InstTrait + From<(InstHole, usize)>> CompileClass<'a, 'b, I> {
     fn compile(mut self) -> Result {
         let mut holes = vec![];
         let mut initial_entry = None;
@@ -1010,9 +1029,9 @@ impl<'a, 'b> CompileClass<'a, 'b> {
         }
     }
 
-    fn c_utf8_seq_<'r, I>(&mut self, seq: I) -> Result
+    fn c_utf8_seq_<'r, S>(&mut self, seq: S) -> Result
     where
-        I: IntoIterator<Item = &'r Utf8Range>,
+        S: IntoIterator<Item = &'r Utf8Range>,
     {
         // The initial instruction for each UTF-8 sequence should be the same.
         let mut from_inst = ::std::usize::MAX;
@@ -1031,17 +1050,14 @@ impl<'a, 'b> CompileClass<'a, 'b> {
                 }
             }
             self.c.byte_classes.set_range(byte_range.start, byte_range.end);
+            let inst_hole = InstHole::Bytes {
+                start: byte_range.start,
+                end: byte_range.end,
+            };
             if from_inst == ::std::usize::MAX {
-                last_hole = self.c.push_hole(InstHole::Bytes {
-                    start: byte_range.start,
-                    end: byte_range.end,
-                });
+                last_hole = self.c.push_hole(inst_hole);
             } else {
-                self.c.push_compiled(Inst::Bytes(InstBytes {
-                    goto: from_inst,
-                    start: byte_range.start,
-                    end: byte_range.end,
-                }));
+                self.c.push_compiled((inst_hole, from_inst).into());
             }
             from_inst = self.c.insts.len().checked_sub(1).unwrap();
             debug_assert!(from_inst < ::std::usize::MAX);

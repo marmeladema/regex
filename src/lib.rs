@@ -763,5 +763,7 @@ pub mod internal {
     pub use crate::exec::{Exec, ExecBuilder};
     pub use crate::input::{Char, CharInput, Input, InputAt};
     pub use crate::literal::LiteralSearcher;
-    pub use crate::prog::{EmptyLook, Inst, InstRanges, Program};
+    pub use crate::prog::{
+        BytesInst, EmptyLook, InstRanges, Program, UnicodeInst,
+    };
 }

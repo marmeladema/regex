@@ -1,3 +1,5 @@
+#![allow(clippy::redundant_static_lifetimes)]
+
 #[cfg(feature = "unicode-age")]
 pub mod age;
 
